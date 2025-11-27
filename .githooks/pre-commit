@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "Running pre-commit verification..."
+
+echo "Checking formatting"
+cargo fmt --all -- --check
+npx prettier --check .
+
+echo "Linting (Rust & TS)"
+cargo clippy --all-targets --all-features -- -D warnings
+npx eslint . --ext .ts --max-warnings=0
+
+echo "Shellcheck"
+if command -v shellcheck >/dev/null 2>&1; then
+  if ls **/*.sh 1> /dev/null 2>&1; then
+    shellcheck **/*.sh
+  fi
+fi
+
+echo "Done."
+

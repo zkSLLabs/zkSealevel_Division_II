@@ -1,0 +1,40 @@
+[workspace]
+
+[package]
+name = "zksl-prover"
+version = "0.1.0"
+edition = "2021"
+description = "zkSealevel prover for STARK proof generation and DS signing"
+license = "Apache-2.0"
+repository = "https://github.com/zkSLLabs/zkSealevel"
+readme = "../README.md"
+keywords = ["solana", "zk", "proof", "stark", "anchor"]
+categories = ["cryptography"]
+
+[dependencies]
+blake3 = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.8"
+bs58 = "0.5"
+anyhow = "1.0"
+hex = "0.4"
+base64 = { version = "0.22", optional = true }
+winter-air = { version = "0.13.1", optional = true }
+winter-math = { version = "0.13.1", optional = true }
+winter-crypto = { version = "0.13.1", optional = true }
+winter-prover = { version = "0.13.1", optional = true }
+winter-verifier = { version = "0.13.1", optional = true }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+ed25519-dalek = "2.2"
+
+[features]
+default = []
+stark = ["base64", "winter-air", "winter-math", "winter-crypto", "winter-prover", "winter-verifier"]
+
+[[bin]]
+name = "prover"
+path = "src/main.rs"
+
+

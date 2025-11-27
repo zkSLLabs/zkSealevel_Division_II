@@ -1,0 +1,67 @@
+name: Anchor Devnet Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      program_name:
+        description: Program name
+        default: validator_lock
+        required: true
+      cluster:
+        description: Solana cluster
+        default: devnet
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Solana CLI v2.1.15
+        run: |
+          sh -c "$(curl -sSfL https://release.solana.com/v2.1.15/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+          solana --version
+
+      - name: Install Anchor CLI 0.32.1
+        run: |
+          cargo install anchor-cli --version 0.32.1
+          anchor --version
+
+      - name: Prepare Solana wallet from secret
+        env:
+          SOLANA_WALLET_JSON: ${{ secrets.SOLANA_WALLET_JSON }}
+        run: |
+          mkdir -p $HOME/.config/solana
+          echo "$SOLANA_WALLET_JSON" > $HOME/.config/solana/id.json
+          chmod 600 $HOME/.config/solana/id.json
+          solana config set --url https://api.${{ github.event.inputs.cluster || 'devnet' }}.solana.com
+          solana config get
+
+      - name: Prepare program keypair from secret
+        env:
+          PROGRAM_KEYPAIR_JSON: ${{ secrets.PROGRAM_KEYPAIR_JSON }}
+        run: |
+          mkdir -p target/deploy
+          echo "$PROGRAM_KEYPAIR_JSON" > target/deploy/${{ github.event.inputs.program_name || 'validator_lock' }}-keypair.json
+          chmod 600 target/deploy/${{ github.event.inputs.program_name || 'validator_lock' }}-keypair.json
+          PUB=$(solana-keygen pubkey target/deploy/${{ github.event.inputs.program_name || 'validator_lock' }}-keypair.json)
+          echo "PROGRAM_ID_VALIDATOR_LOCK=$PUB" >> $GITHUB_ENV
+          echo "PROGRAM_ID=$PUB" >> $GITHUB_ENV
+
+      - name: Clean and build (no IDL)
+        run: |
+          anchor clean
+          anchor build --no-idl
+
+      - name: Deploy to devnet
+        run: |
+          anchor deploy --provider.cluster ${{ github.event.inputs.cluster || 'devnet' }} \
+            --program-name ${{ github.event.inputs.program_name || 'validator_lock' }} \
+            --program-keypair target/deploy/${{ github.event.inputs.program_name || 'validator_lock' }}-keypair.json
+          anchor keys list

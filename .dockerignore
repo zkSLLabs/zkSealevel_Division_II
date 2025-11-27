@@ -1,0 +1,44 @@
+.git
+.gitignore
+.github
+.vscode
+.idea
+node_modules
+**/node_modules
+dist
+**/dist
+build
+**/build
+coverage
+**/coverage
+target
+**/target
+.anchor
+.cache
+tmp
+out
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment and secrets
+.env
+.env.*
+.envrc
+.direnv
+keys/
+**/keys/*
+!keys/*.example.json
+!keys/README.md
+
+# App data artifacts
+orchestrator/data/artifacts/
+data/artifacts/
+
+# OS noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+Codebase_Policy.md
+

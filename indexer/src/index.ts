@@ -1,0 +1,226 @@
+import * as crypto from "node:crypto";
+import * as web3 from "@solana/web3.js";
+import type { KeyedAccountInfo } from "@solana/web3.js";
+import dotenv from "dotenv";
+import { Client as PgClient } from "pg";
+import { decodeProofRecord, decodeValidatorRecord } from "./codec.js";
+import { upsertProof, upsertValidator, updateLastSignature } from "./db.js";
+
+dotenv.config({ path: process.cwd() + "/.env" });
+// types and decode functions moved to codec.ts for testability
+
+async function main(): Promise<void> {
+  const databaseUrl =
+    process.env.DATABASE_URL ||
+    "postgres://postgres:postgres@localhost:5432/zksl";
+  const rpcUrl = process.env.RPC_URL || "http://localhost:8899";
+  const programIdStr = process.env.PROGRAM_ID_VALIDATOR_LOCK || "";
+  if (!programIdStr) throw new Error("PROGRAM_ID_VALIDATOR_LOCK is required");
+
+  const pg = new PgClient({ connectionString: databaseUrl });
+  await pg.connect();
+
+  const programId = new web3.PublicKey(programIdStr);
+  const commitment =
+    (process.env.MIN_FINALITY_COMMITMENT as web3.Commitment) ||
+    ("finalized" as web3.Commitment);
+  const connection = new web3.Connection(rpcUrl, { commitment });
+
+  const prDisc = sha256_8("account:ProofRecord");
+  const vrDisc = sha256_8("account:ValidatorRecord");
+
+  process.stdout.write("indexer started\n");
+  try {
+    subscribeProgramAccounts({ connection, programId, prDisc, vrDisc, pg });
+  } catch (e) {
+    process.stderr.write(
+      "ws subscribe failed, will continue with polling: " + String(e) + "\n"
+    );
+  }
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    await scanOnce({ connection, programId, prDisc, vrDisc, pg });
+    await reconcilePending({ connection, pg });
+    await sleep(20000);
+  }
+}
+
+async function scanOnce(params: {
+  connection: web3.Connection;
+  programId: web3.PublicKey;
+  prDisc: Buffer;
+  vrDisc: Buffer;
+  pg: PgClient;
+}): Promise<void> {
+  const { connection, programId, prDisc, vrDisc, pg } = params;
+  await pg.query(`UPDATE indexer_state SET last_scan_ts = NOW() WHERE id = 1`);
+  const accounts = await connection.getProgramAccounts(programId);
+  const cur = await pg.query(
+    `SELECT last_seen_slot FROM indexer_state WHERE id = 1`
+  );
+  const slotVal = cur.rows?.[0]?.last_seen_slot;
+  const lastSeen: bigint =
+    slotVal !== null && slotVal !== undefined ? BigInt(String(slotVal)) : 0n;
+  let maxSlot: bigint = lastSeen;
+  for (const acc of accounts) {
+    const data: Buffer = acc.account.data;
+    const head = data.subarray(0, 8);
+    if (head.equals(prDisc)) {
+      const pr = decodeProofRecord(data);
+      if (pr.end_slot <= lastSeen) continue;
+      const txid = await firstSignatureForAddress(connection, acc.pubkey);
+      const commitment = await commitmentOfSig(connection, txid);
+      await upsertProof(pg, { ...pr, txid, commitment_level: commitment });
+      if (commitment >= 1 && txid) {
+        await updateLastSignature(pg, txid);
+      }
+      if (pr.end_slot > maxSlot) maxSlot = pr.end_slot;
+    } else if (head.equals(vrDisc)) {
+      const vr = decodeValidatorRecord(data);
+      await upsertValidator(pg, vr);
+    }
+  }
+  try {
+    const slot = await connection.getSlot();
+    await pg.query(
+      `UPDATE indexer_state SET last_seen_slot = $1 WHERE id = 1`,
+      [slot.toString()]
+    );
+  } catch (err) {
+    // Ignore slot update errors
+    void err;
+  }
+  try {
+    if (maxSlot > lastSeen) {
+      await pg.query(
+        `UPDATE indexer_state SET last_seen_slot = $1 WHERE id = 1`,
+        [maxSlot.toString()]
+      );
+    }
+  } catch (err) {
+    // Ignore slot update errors
+    void err;
+  }
+}
+
+// decodeProofRecord is imported
+
+async function firstSignatureForAddress(
+  connection: web3.Connection,
+  address: web3.PublicKey
+): Promise<string> {
+  const sigs = await connection.getSignaturesForAddress(
+    address,
+    { limit: 1 },
+    "confirmed"
+  );
+  return sigs[0]?.signature || "";
+}
+
+async function commitmentOfSig(
+  connection: web3.Connection,
+  sig: string
+): Promise<number> {
+  if (!sig) return 0;
+  const st = await connection.getSignatureStatuses([sig], {
+    searchTransactionHistory: true,
+  });
+  const s = st.value[0];
+  const cs = s?.confirmationStatus;
+  return cs === "finalized" ? 2 : cs === "confirmed" ? 1 : 0;
+}
+
+function sha256_8(s: string): Buffer {
+  const h = crypto.createHash("sha256").update(s, "utf8").digest();
+  return h.subarray(0, 8);
+}
+
+// uuidFrom16 moved to codec.ts
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function subscribeProgramAccounts(params: {
+  connection: web3.Connection;
+  programId: web3.PublicKey;
+  prDisc: Buffer;
+  vrDisc: Buffer;
+  pg: PgClient;
+}): void {
+  const { connection, programId, prDisc, vrDisc, pg } = params;
+  const id = connection.onProgramAccountChange(
+    programId,
+    (info: KeyedAccountInfo) => {
+      void (async () => {
+        try {
+          const data: Buffer = info.accountInfo.data;
+          const head = data.subarray(0, 8);
+          if (head.equals(prDisc)) {
+            // Skip proof upsert on WS path to avoid NOT NULL/UNIQUE txid constraint issues.
+            // Polling path (scanOnce) will backfill proofs with real txid.
+          } else if (head.equals(vrDisc)) {
+            const vr = decodeValidatorRecord(data);
+            await upsertValidator(pg, vr);
+          }
+        } catch (err) {
+          // Swallow account change errors
+          void err;
+        }
+      })();
+    }
+  );
+  process.stdout.write("ws subscription id: " + String(id) + "\n");
+}
+
+async function reconcilePending(params: {
+  connection: web3.Connection;
+  pg: PgClient;
+}): Promise<void> {
+  const { connection, pg } = params;
+  const res = await pg.query(
+    `SELECT txid, extract(epoch from ts) AS ts_epoch FROM proofs WHERE commitment_level < 2 ORDER BY ts ASC LIMIT 100`
+  );
+  if (!res.rows.length) return;
+  type Row = { txid: string; ts_epoch?: number | string | null };
+  const rows = res.rows as Row[];
+  for (const row of rows) {
+    const sig = String(row.txid || "");
+    if (!sig) continue;
+    const st = await connection.getSignatureStatuses([sig], {
+      searchTransactionHistory: true,
+    });
+    const s = st.value[0];
+    if (!s || s.err) {
+      const age =
+        row.ts_epoch !== null && row.ts_epoch !== undefined
+          ? Date.now() / 1000 - Number(row.ts_epoch)
+          : 99999;
+      if (age > 60) {
+        await pg.query(`DELETE FROM proofs WHERE txid = $1`, [sig]);
+      }
+    } else {
+      const cs = s.confirmationStatus;
+      const level = cs === "finalized" ? 2 : cs === "confirmed" ? 1 : 0;
+      await pg.query(
+        `UPDATE proofs SET commitment_level = $1 WHERE txid = $2`,
+        [level, sig]
+      );
+      if (level >= 1) {
+        await updateLastSignature(pg, sig);
+      }
+    }
+  }
+  await pg.query(
+    `UPDATE indexer_state SET last_reconciled_ts = NOW() WHERE id = 1`
+  );
+}
+
+// decodeValidatorRecord is imported
+
+// db helpers imported
+
+main().catch((e) => {
+  process.stderr.write(String(e) + "\n");
+  process.exit(1);
+});

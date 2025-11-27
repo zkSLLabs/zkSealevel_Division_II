@@ -1,0 +1,24 @@
+{
+  "name": "zksl-root",
+  "private": true,
+  "scripts": {
+    "kat:ds": "node scripts/kats/ds_kat.js",
+    "kats:all": "node scripts/kats/ds_kat.js && node scripts/kats/ds_negative_kat.js && node scripts/kats/anchor_proof_kat.js && node scripts/kats/canonical_kat.js && node scripts/kats/pda_kat.js",
+    "build:services": "npm --prefix orchestrator ci && npm --prefix orchestrator run build && npm --prefix indexer ci && npm --prefix indexer run build",
+    "test:orchestrator": "npm --prefix orchestrator run test",
+    "test:kats": "npm run kats:all",
+    "test:all": "npm run test:orchestrator && npm --prefix indexer run test && npm run test:kats",
+    "conformance": "node scripts/conformance.js",
+    "devnet:keys": "node scripts/gen_aggregator_key.js",
+    "devnet:runbook": "powershell -ExecutionPolicy Bypass -File scripts/devnet_runbook.ps1",
+    "devnet:docker": "powershell -ExecutionPolicy Bypass -File scripts/devnet_docker_deploy.ps1"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "blake3": "^2.1.7",
+    "tweetnacl": "^1.0.3"
+  },
+  "engines": {
+    "node": ">=22 <23"
+  }
+}

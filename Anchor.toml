@@ -1,0 +1,14 @@
+[toolchain]
+anchor_version = "0.32.1"
+
+[workspace]
+members = ["programs/validator_lock"]
+
+[provider]
+cluster = "Devnet"
+wallet = "~/.config/solana/id.json"
+
+#[programs.localnet]
+#validator_lock = "9o5T1cRj3oSw49gp5gKgVfPgNMjQSuD3rMiTU9BxeLZx"
+
+

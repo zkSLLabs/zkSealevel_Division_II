@@ -1,0 +1,3 @@
+cognitive-complexity-threshold = 10
+doc-valid-idents = ["UUID", "API", "JSON", "gRPC"]
+

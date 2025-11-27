@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      PROGRAM_ID_VALIDATOR_LOCK: BCx5eHewBbe6Ft2xXpDXTghuiy5WxM636xN5G45KCp5E
+      CHAIN_ID: "103"
+      AGGREGATOR_KEYPAIR_PATH: ./keys/aggregator.json
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zksl
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: zksl
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install root deps
+        run: npm ci --no-audit --no-fund
+
+      - name: Install package deps
+        run: |
+          npm --prefix orchestrator ci --no-audit --no-fund
+          npm --prefix indexer ci --no-audit --no-fund
+          npm --prefix cli ci --no-audit --no-fund
+
+      - name: Lint
+        run: |
+          npm --prefix orchestrator run lint
+          npm --prefix indexer run lint
+          npm --prefix cli run lint || true
+
+      - name: Build services
+        run: npm run build:services
+
+      - name: Apply DB migrations
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          bash scripts/db_migrate.sh
+
+      - name: Run tests
+        run: npm run test:all
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: ""
+        continue-on-error: false
+
+      - name: Cargo audit (Rust deps)
+        run: |
+          cargo install cargo-audit || true
+          cargo audit --deny warnings
+
+      - name: NPM audit (Node deps)
+        run: |
+          npm --prefix orchestrator audit --audit-level=high
+          npm --prefix indexer audit --audit-level=high
+          npm --prefix cli audit --audit-level=high || true
+
+      - name: Check version drift against scripts/versions.env
+        run: |
+          set -e
+          if [ -f scripts/versions.env ]; then
+            . scripts/versions.env
+            echo "Expected Anchor: $ANCHOR_CLI_VERSION, Solana: $SOLANA_VERSION, Node: $NODE_MAJOR"
+            grep -R "$SOLANA_VERSION" -n ./.github/workflows || (echo "Solana version drift"; exit 1)
+            grep -R "$ANCHOR_CLI_VERSION" -n ./.github/workflows || (echo "Anchor version drift"; exit 1)
+            if ! grep -R "node-version: $NODE_MAJOR" -n ./.github/workflows ; then echo "Node version drift"; exit 1; fi
+          fi
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: "fs"
+          ignore-unfixed: true
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+
+      - name: Verify non-root USER in Dockerfiles
+        run: |
+          grep -q "^USER " orchestrator/Dockerfile
+          grep -q "^USER " indexer/Dockerfile
+
+      - name: Hadolint Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: orchestrator/Dockerfile
+      - name: Hadolint Dockerfiles (indexer)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: indexer/Dockerfile
+
+      - name: Setup test keys
+        run: |
+          mkdir -p keys
+          cp keys/aggregator.example.json keys/aggregator.json
+          cp keys/sol_agg.example.json keys/sol_agg.json
+
+      - name: Conformance (Node vs Rust)
+        run: npm run conformance
+
+      - name: Rust tests
+        run: |
+          cargo test --workspace --all-features --no-run
+          cargo test --workspace --all-features

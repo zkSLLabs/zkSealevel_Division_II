@@ -1,0 +1,104 @@
+version: "3.9"
+services:
+  solana:
+    image: solanalabs/solana:v2.1.15
+    command: solana-test-validator -r --ledger /ledger --wal-recovery-mode skip_any_corrupted_record
+    ports:
+      - "8899:8899"
+      - "8900:8900"
+    volumes:
+      - ../ledger:/ledger
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -s http://localhost:8899 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zksl
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: orchestrator/Dockerfile
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+      - /run
+      - /var/tmp
+    volumes:
+      - orchestrator_artifacts:/app/orchestrator/data/artifacts
+    mem_limit: 1g
+    cpus: 1.0
+    environment:
+      - PORT=8080
+      - RPC_URL=http://solana:8899
+      - WS_URL=ws://solana:8900
+      - PROGRAM_ID_VALIDATOR_LOCK=${PROGRAM_ID_VALIDATOR_LOCK}
+      - CHAIN_ID=${CHAIN_ID}
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/zksl
+    ports:
+      - "8080:8080"
+    depends_on:
+      - solana
+      - postgres
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-lc",
+          "curl -sf http://localhost:8080/health | grep -q ok",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # prover service removed; no prover required for Devnet-only v1
+
+  indexer:
+    build:
+      context: ../indexer
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+      - /run
+      - /var/tmp
+    mem_limit: 512m
+    cpus: 0.5
+    environment:
+      - RPC_URL=http://solana:8899
+      - WS_URL=ws://solana:8900
+      - PROGRAM_ID_VALIDATOR_LOCK=${PROGRAM_ID_VALIDATOR_LOCK}
+      - CHAIN_ID=${CHAIN_ID}
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/zksl
+    depends_on:
+      - solana
+      - postgres
+
+networks:
+  default:
+    driver: bridge
+volumes:
+  orchestrator_artifacts:
