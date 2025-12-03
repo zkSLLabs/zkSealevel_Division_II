@@ -1,0 +1,1568 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::missing_errors_doc)]
+
+use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use serde::{Deserialize, Serialize};
+use winter_air::{
+    Air, AirContext, Assertion, EvaluationFrame, FieldExtension, ProofOptions, TraceInfo,
+    TransitionConstraintDegree,
+};
+use winter_crypto::{hashers::Rp64_256, DefaultRandomCoin, MerkleTree};
+use winter_math::{fields::f64::BaseElement as Felt, FieldElement, StarkField, ToElements};
+use winter_prover::{
+    matrix::ColMatrix, DefaultConstraintCommitment, DefaultConstraintEvaluator, DefaultTraceLde,
+    Proof, Prover, StarkDomain, TracePolyTable, TraceTable,
+};
+use winter_verifier::{verify, AcceptableOptions, VerifierError};
+
+// ================================================================================================
+// RPO-256 CONSTANTS (Polygon Miden style; must be fixed & agreed off-chain)
+// ================================================================================================
+
+const TWO_32: u64 = 4294967296;
+const RPO_ALPHA: u64 = 7;
+const STATE_WIDTH: usize = 12;
+const NUM_ROUNDS: usize = 7;
+const ROUNDS_PER_WITNESS: usize = NUM_ROUNDS + 1; // 7 hash rounds + 1 transition row
+
+// Circulant MDS
+#[rustfmt::skip]
+const MDS: [[u64; 12]; 12] = [
+    [7, 23, 8, 26, 13, 10, 9, 4, 5, 2, 3, 1],
+    [1, 7, 23, 8, 26, 13, 10, 9, 4, 5, 2, 3],
+    [3, 1, 7, 23, 8, 26, 13, 10, 9, 4, 5, 2],
+    [2, 3, 1, 7, 23, 8, 26, 13, 10, 9, 4, 5],
+    [5, 2, 3, 1, 7, 23, 8, 26, 13, 10, 9, 4],
+    [4, 5, 2, 3, 1, 7, 23, 8, 26, 13, 10, 9],
+    [9, 4, 5, 2, 3, 1, 7, 23, 8, 26, 13, 10],
+    [10, 9, 4, 5, 2, 3, 1, 7, 23, 8, 26, 13],
+    [13, 10, 9, 4, 5, 2, 3, 1, 7, 23, 8, 26],
+    [26, 13, 10, 9, 4, 5, 2, 3, 1, 7, 23, 8],
+    [8, 26, 13, 10, 9, 4, 5, 2, 3, 1, 7, 23],
+    [23, 8, 26, 13, 10, 9, 4, 5, 2, 3, 1, 7],
+];
+
+// Example ARK constants – must be fixed once and shared by prover/verifier.
+// They *do not* need to match Polygon mainnet RPO as long as both sides agree.
+#[rustfmt::skip]
+const ARK: [[u64; 12]; NUM_ROUNDS] = [
+    [0x88c21a6d05a84b28, 0x548196cb68458a88, 0x3e8acfe0c6e89015, 0x95d8d79dc0e5a5a2,
+     0x8e6a0fd8c5d0e9eb, 0x82c0a5f37f8e62b8, 0x4e9f17f27c4a3b5c, 0x6b5e6e7a8f6d5a4c,
+     0x2c3e5f6a7b8c9d0e, 0x1f2e3d4c5b6a7988, 0x8796a5b4c3d2e1f0, 0xf0e1d2c3b4a59687],
+    [0xd16d14d1387ae2fc, 0x6854e56efb8a5819, 0x95176c0e73f14a9e, 0xa687ec279c2e8c8e,
+     0xef3e88d6c2b89f6f, 0xb384a6bb7c3e9fa9, 0x7c8e5d4a3b2c1d0e, 0x9f8e7d6c5b4a3928,
+     0x1a2b3c4d5e6f7089, 0x89706f5e4d3c2b1a, 0x0f1e2d3c4b5a6978, 0x7869584736251403],
+    [0x4a5e3c2d1e0f8796, 0x9687a5b4c3d2e1f0, 0xf0e1d2c3b4a59687, 0x8796a5b4c3d2e1f0,
+     0x1f2e3d4c5b6a7988, 0x8897a6b5c4d3e2f1, 0x2d3c4b5a69788796, 0x96877685a49392a1,
+     0xa1b2c3d4e5f67890, 0x0f1e2d3c4b5a6978, 0x7869584736251403, 0x0312243546576879],
+    [0x5a6b7c8d9e0f1a2b, 0x3c4d5e6f70819283, 0x94a5b6c7d8e9f0a1, 0xb2c3d4e5f6071829,
+     0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829, 0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829,
+     0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829, 0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829],
+    [0x1d2e3f4a5b6c7d8e, 0x9f0a1b2c3d4e5f60, 0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60,
+     0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60, 0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60,
+     0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60, 0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60],
+    [0x2b3c4d5e6f708192, 0x83940a5b6c7d8e9f, 0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9,
+     0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9, 0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9,
+     0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9, 0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9],
+    [0x3e4f5061728394a5, 0xb6c7d8e9f0a1b2c3, 0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3,
+     0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3, 0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3,
+     0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3, 0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3],
+];
+
+// ================================================================================================
+// DATA STRUCTURES
+// ================================================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublicInputs {
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub initial_state_root: [u8; 32],
+    pub final_state_root: [u8; 32],
+    pub blockhash: [u8; 32],
+}
+
+impl ToElements<Felt> for PublicInputs {
+    fn to_elements(&self) -> Vec<Felt> {
+        let mut res = Vec::with_capacity(14);
+        res.push(Felt::new(self.start_slot));
+        res.push(Felt::new(self.end_slot));
+        res.extend(bytes_to_felts(&self.initial_state_root));
+        res.extend(bytes_to_felts(&self.final_state_root));
+        res.extend(bytes_to_felts(&self.blockhash));
+        res
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct StarkProofEnvelope {
+    pub proof: String,
+    pub public_inputs: PublicInputs,
+}
+
+// ================================================================================================
+// TRACE GENERATION
+// ================================================================================================
+//
+// Trace layout (161 columns):
+//
+//  0..11   : RPO state
+//  12      : round counter (0..7)
+//  13      : slot
+//  14..21  : slot delta bits (8 bits)
+//  22      : stake_lo (32-bit)
+//  23      : stake_hi (32-bit)
+//  24      : delta_lo (32-bit)
+//  25      : delta_hi (32-bit)
+//  26      : aux carry/borrow bit
+//  27      : sign (0 = add, 1 = sub) comparing stake_{i+1} vs stake_i
+//  28..59  : stake_lo bits
+//  60..91  : stake_hi bits
+//  92..123 : delta_lo bits
+//  124..155: delta_hi bits
+//  156..159: "next_root" felts for this witness segment
+//  160     : transition_flag (1 on last row of a witness)
+
+const NUM_COLS: usize = 161;
+
+pub fn build_trace(
+    witnesses: &[crate::witness::SlotWitness],
+    pub_inputs: &PublicInputs,
+) -> Result<TraceTable<Felt>> {
+    if witnesses.is_empty() {
+        anyhow::bail!("Witnesses cannot be empty");
+    }
+    if witnesses.len() > 100_000 {
+        anyhow::bail!("Trace exceeds maximum length (100,000 witnesses)");
+    }
+
+    // Slot range sanity.
+    if witnesses[0].slot != pub_inputs.start_slot {
+        anyhow::bail!(
+            "Start slot mismatch: witness[0]={}, public={}",
+            witnesses[0].slot,
+            pub_inputs.start_slot
+        );
+    }
+    if witnesses.last().unwrap().slot != pub_inputs.end_slot {
+        anyhow::bail!(
+            "End slot mismatch: last witness={}, public={}",
+            witnesses.last().unwrap().slot,
+            pub_inputs.end_slot
+        );
+    }
+
+    // Slots strictly increasing.
+    for i in 1..witnesses.len() {
+        if witnesses[i].slot <= witnesses[i - 1].slot {
+            anyhow::bail!("Slots must be strictly increasing at index {}", i);
+        }
+    }
+
+    let trace_len = witnesses.len() * ROUNDS_PER_WITNESS;
+    let mut trace = vec![Vec::with_capacity(trace_len); NUM_COLS];
+
+    let blockhash_felts = bytes_to_felts(&pub_inputs.blockhash);
+
+    // We build a chain of roots r_0..r_n.
+    // r_0 = initial_state_root (public).
+    // For i in [0..n-1]:
+    //   r_{i+1} = RPO_7( r_i || slot_i || stake_i || blockhash ).
+    //
+    // The witnesses carry private intermediate roots (and stakes), but the public statement
+    // refers only to r_0 and r_n.
+
+    let mut prev_root = bytes_to_felts(&pub_inputs.initial_state_root);
+
+    for (witness_idx, w) in witnesses.iter().enumerate() {
+        let is_last_witness = witness_idx == witnesses.len() - 1;
+
+        // Compute total_stake for this slot.
+        let total_stake_u128: u128 = w
+            .vote_accounts
+            .iter()
+            .map(|v| v.activated_stake as u128)
+            .sum();
+
+        if total_stake_u128 > u64::MAX as u128 {
+            anyhow::bail!("Stake overflow at slot {}", w.slot);
+        }
+        let total_stake = total_stake_u128 as u64;
+
+        // Next stake for delta (or zero for last).
+        let next_stake = if is_last_witness {
+            total_stake
+        } else {
+            let s: u128 = witnesses[witness_idx + 1]
+                .vote_accounts
+                .iter()
+                .map(|v| v.activated_stake as u128)
+                .sum();
+            if s > u64::MAX as u128 {
+                anyhow::bail!(
+                    "Stake overflow at next slot {}",
+                    witnesses[witness_idx + 1].slot
+                );
+            }
+            s as u64
+        };
+
+        let (delta_abs, sign) = if next_stake >= total_stake {
+            (next_stake - total_stake, 0u64)
+        } else {
+            (total_stake - next_stake, 1u64)
+        };
+
+        let stake_lo = total_stake & 0xFFFF_FFFF;
+        let stake_hi = total_stake >> 32;
+        let delta_lo = delta_abs & 0xFFFF_FFFF;
+        let delta_hi = delta_abs >> 32;
+
+        if stake_lo > 0xFFFF_FFFF || stake_hi > 0xFFFF_FFFF {
+            anyhow::bail!("Stake limb overflow at slot {}", w.slot);
+        }
+        if delta_lo > 0xFFFF_FFFF || delta_hi > 0xFFFF_FFFF {
+            anyhow::bail!("Delta limb overflow at slot {}", w.slot);
+        }
+
+        let slot_delta = if is_last_witness {
+            0u64
+        } else {
+            witnesses[witness_idx + 1].slot - w.slot
+        };
+        if slot_delta >= 256 {
+            anyhow::bail!("Slot delta too large at slot {}: {}", w.slot, slot_delta);
+        }
+
+        // Target root r_{i+1}.
+        let next_root = if is_last_witness {
+            bytes_to_felts(&pub_inputs.final_state_root)
+        } else {
+            bytes_to_felts(&witnesses[witness_idx + 1].state_root)
+        };
+
+        // Hash state for this witness.
+        let mut hash_state = [Felt::ZERO; STATE_WIDTH];
+
+        // 8 rows per witness: 7 hash rounds + 1 transition.
+        for round in 0..ROUNDS_PER_WITNESS {
+            // Round counter
+            trace[12].push(Felt::new(round as u64));
+
+            // Hash evolution: only for rounds 0..6.
+            if round < NUM_ROUNDS {
+                if round == 0 {
+                    // Initialize state for this witness:
+                    // [ r_i[0..4], slot, stake_lo, stake_hi, blockhash[0..4] ]
+                    hash_state = [Felt::ZERO; STATE_WIDTH];
+                    hash_state[0] = prev_root[0];
+                    hash_state[1] = prev_root[1];
+                    hash_state[2] = prev_root[2];
+                    hash_state[3] = prev_root[3];
+                    hash_state[4] = Felt::new(w.slot);
+                    hash_state[5] = Felt::new(stake_lo);
+                    hash_state[6] = Felt::new(stake_hi);
+                    hash_state[7] = blockhash_felts[0];
+                    hash_state[8] = blockhash_felts[1];
+                    hash_state[9] = blockhash_felts[2];
+                    hash_state[10] = blockhash_felts[3];
+                    hash_state[11] = Felt::ZERO;
+                }
+
+                // Apply one RPO round: S-Box then MDS.
+                let mut after_sbox = [Felt::ZERO; STATE_WIDTH];
+                for i in 0..STATE_WIDTH {
+                    let ark = Felt::new(ARK[round][i]);
+                    after_sbox[i] = (hash_state[i] + ark).exp(Felt::from(RPO_ALPHA));
+                }
+
+                let mut next_state = [Felt::ZERO; STATE_WIDTH];
+                for i in 0..STATE_WIDTH {
+                    for j in 0..STATE_WIDTH {
+                        next_state[i] += after_sbox[j] * Felt::new(MDS[i][j]);
+                    }
+                }
+
+                hash_state = next_state;
+            }
+
+            // Push hash state.
+            for i in 0..STATE_WIDTH {
+                trace[i].push(hash_state[i]);
+            }
+
+            // Slot column.
+            trace[13].push(Felt::new(w.slot));
+
+            // Slot delta bits.
+            for b in 0..8 {
+                trace[14 + b].push(Felt::new((slot_delta >> b) & 1));
+            }
+
+            // Arithmetic columns.
+            trace[22].push(Felt::new(stake_lo));
+            trace[23].push(Felt::new(stake_hi));
+            trace[24].push(Felt::new(delta_lo));
+            trace[25].push(Felt::new(delta_hi));
+            trace[26].push(Felt::new(aux_for(stake_lo, delta_lo, sign)));
+            trace[27].push(Felt::new(sign));
+
+            // Bit decompositions.
+            push_bits(&mut trace, 28, stake_lo, 32);
+            push_bits(&mut trace, 60, stake_hi, 32);
+            push_bits(&mut trace, 92, delta_lo, 32);
+            push_bits(&mut trace, 124, delta_hi, 32);
+
+            // Target root columns (r_{i+1}); constant across this witness.
+            for j in 0..4 {
+                trace[156 + j].push(next_root[j]);
+            }
+
+            // Transition flag: 1 on last row (round == 7), else 0.
+            let is_transition = if round == ROUNDS_PER_WITNESS - 1 {
+                1u64
+            } else {
+                0u64
+            };
+            trace[160].push(Felt::new(is_transition));
+        }
+
+        // Move to next root in the chain.
+        prev_root = next_root;
+    }
+
+    Ok(TraceTable::init(trace))
+}
+
+fn aux_for(stake_lo: u64, delta_lo: u64, sign: u64) -> u64 {
+    if sign == 0 {
+        // add: carry out
+        (stake_lo + delta_lo) / TWO_32
+    } else {
+        // sub: borrow
+        if stake_lo < delta_lo {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+fn push_bits(trace: &mut [Vec<Felt>], start_col: usize, value: u64, num_bits: usize) {
+    for b in 0..num_bits {
+        trace[start_col + b].push(Felt::new((value >> b) & 1));
+    }
+}
+
+// ================================================================================================
+// AIR IMPLEMENTATION
+// ================================================================================================
+
+#[derive(Clone)]
+pub struct SolanaStateAir {
+    context: AirContext<Felt>,
+    pub_inputs: PublicInputs,
+}
+
+impl Air for SolanaStateAir {
+    type BaseField = Felt;
+    type PublicInputs = PublicInputs;
+
+    fn new(trace_info: TraceInfo, pub_inputs: PublicInputs, options: ProofOptions) -> Self {
+        let mut degrees = Vec::new();
+
+        // 0..11: hash constraints (degree ~7 due to x^7 S-box).
+        for _ in 0..12 {
+            degrees.push(TransitionConstraintDegree::new(7));
+        }
+
+        // 12: round counter (degree 1).
+        degrees.push(TransitionConstraintDegree::new(1));
+
+        // 13: slot transition (degree 2).
+        degrees.push(TransitionConstraintDegree::new(2));
+
+        // 14..21: slot bits binary (degree 2).
+        for _ in 0..8 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        // 22..27: arithmetic constraints (degree 2).
+        for _ in 0..6 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        // 28..155: bit validity (degree 2).
+        for _ in 0..128 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        // Bit recomposition (4 limbs) (degree 1).
+        for _ in 0..4 {
+            degrees.push(TransitionConstraintDegree::new(1));
+        }
+
+        // Root chaining constraints (4 coords) (degree 2).
+        for _ in 0..4 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        let options = options.with_field_extension(FieldExtension::Quadratic);
+        let context = AirContext::new(trace_info, degrees, 8, options);
+        Self { context, pub_inputs }
+    }
+
+    fn context(&self) -> &AirContext<Felt> {
+        &self.context
+    }
+
+    fn evaluate_transition<E: FieldElement<BaseField = Felt>>(
+        &self,
+        frame: &EvaluationFrame<E>,
+        _periodic_values: &[E],
+        result: &mut [E],
+    ) {
+        let current = frame.current();
+        let next = frame.next();
+
+        let one = E::ONE;
+        let two_32 = E::from(TWO_32);
+
+        let round = current[12];
+        let transition_flag = current[160];
+        let is_hash_round = one - transition_flag;
+        let is_transition_round = transition_flag;
+
+        let mut constraint_idx = 0;
+
+        // ---------------------------
+        // 1. HASH CONSTRAINTS (0..11)
+        // ---------------------------
+        //
+        // For rows with transition_flag = 0:
+        // next_state = MDS( (current_state + ARK_round)^7 ).
+        //
+        // For rows with transition_flag = 1 (round==7), hash constraint is disabled.
+
+        let round_idx = (round.as_int() as usize) % NUM_ROUNDS;
+
+        // Precompute S-box for all lanes.
+        let mut sbox_values = [E::ZERO; STATE_WIDTH];
+        for j in 0..STATE_WIDTH {
+            let ark_j = E::from(ARK[round_idx][j]);
+            sbox_values[j] = (current[j] + ark_j).exp(E::PositiveInteger::from(RPO_ALPHA));
+        }
+
+        for i in 0..STATE_WIDTH {
+            let mut mds_result = E::ZERO;
+            for j in 0..STATE_WIDTH {
+                mds_result += sbox_values[j] * E::from(MDS[i][j]);
+            }
+            result[constraint_idx] = (next[i] - mds_result) * is_hash_round;
+            constraint_idx += 1;
+        }
+
+        // ------------------------------------
+        // 2. ROUND COUNTER PROGRESSION (index)
+        // ------------------------------------
+        //
+        // round' = round + 1        on hash rows
+        // round' = 0                on transition row
+        //
+        // Implemented as: round' = round + 1 - transition_flag * 8
+
+        let next_round_expected = (round + one) - (transition_flag * E::from(8u32));
+        result[constraint_idx] = next[12] - next_round_expected;
+        constraint_idx += 1;
+
+        // ----------------------------
+        // 3. SLOT TRANSITION (index)
+        // ----------------------------
+        //
+        // Let slot_delta be reconstructed from bits[14..21].
+        // On transition rows: next_slot = current_slot + slot_delta.
+
+        let mut slot_delta = E::ZERO;
+        let mut pow2 = E::ONE;
+        for i in 0..8 {
+            slot_delta += current[14 + i] * pow2;
+            pow2 *= E::from(2u32);
+        }
+
+        result[constraint_idx] =
+            (next[13] - (current[13] + slot_delta)) * is_transition_round;
+        constraint_idx += 1;
+
+        // ---------------------
+        // 4. SLOT BIT BINARY
+        // ---------------------
+
+        for i in 0..8 {
+            let bit = current[14 + i];
+            result[constraint_idx] = bit * (bit - one);
+            constraint_idx += 1;
+        }
+
+        // ------------------------
+        // 5. ARITHMETIC LANE
+        // ------------------------
+        //
+        // stake_{i+1} = stake_i ± delta, with aux carry/borrow, checked on transition rows.
+
+        let stake_lo = current[22];
+        let stake_hi = current[23];
+        let delta_lo = current[24];
+        let delta_hi = current[25];
+        let aux = current[26];
+        let sign = current[27];
+
+        let stake_lo_next = next[22];
+        let stake_hi_next = next[23];
+
+        let is_add = one - sign;
+        let is_sub = sign;
+
+        // Low limb:
+        //
+        // Add: stake_lo + delta_lo = stake_lo_next + aux * 2^32
+        // Sub: stake_lo - delta_lo + aux * 2^32 = stake_lo_next
+
+        let add_lo =
+            (stake_lo + delta_lo) - (stake_lo_next + aux * two_32);
+        let sub_lo =
+            (stake_lo - delta_lo + aux * two_32) - stake_lo_next;
+
+        result[constraint_idx] =
+            (is_add * add_lo + is_sub * sub_lo) * is_transition_round;
+        constraint_idx += 1;
+
+        // High limb:
+        //
+        // Add: stake_hi + delta_hi + aux = stake_hi_next
+        // Sub: stake_hi - delta_hi - aux = stake_hi_next
+
+        let add_hi = (stake_hi + delta_hi + aux) - stake_hi_next;
+        let sub_hi = (stake_hi - delta_hi - aux) - stake_hi_next;
+
+        result[constraint_idx] =
+            (is_add * add_hi + is_sub * sub_hi) * is_transition_round;
+        constraint_idx += 1;
+
+        // aux binary
+        result[constraint_idx] = aux * (aux - one);
+        constraint_idx += 1;
+
+        // sign binary
+        result[constraint_idx] = sign * (sign - one);
+        constraint_idx += 1;
+
+        // delta const within witness on hash rows
+        result[constraint_idx] = (next[24] - delta_lo) * is_hash_round;
+        constraint_idx += 1;
+
+        result[constraint_idx] = (next[25] - delta_hi) * is_hash_round;
+        constraint_idx += 1;
+
+        // -------------------------
+        // 6. BIT VALIDITY 0/1
+        // -------------------------
+
+        for i in 0..128 {
+            let bit = current[28 + i];
+            result[constraint_idx] = bit * (bit - one);
+            constraint_idx += 1;
+        }
+
+        // -----------------------------
+        // 7. BIT RECOMPOSITION (4 limbs)
+        // -----------------------------
+
+        let limbs_to_check = [(22usize, 28usize), (23, 60), (24, 92), (25, 124)];
+
+        for (limb_col, bit_start) in limbs_to_check {
+            let mut reconstructed = E::ZERO;
+            let mut p2 = E::ONE;
+            for i in 0..32 {
+                reconstructed += current[bit_start + i] * p2;
+                p2 *= E::from(2u32);
+            }
+            result[constraint_idx] = current[limb_col] - reconstructed;
+            constraint_idx += 1;
+        }
+
+        // ------------------------------------
+        // 8. ROOT CHAINING ON TRANSITION ROWS
+        // ------------------------------------
+        //
+        // Columns[0..4] carry the RPO state. On transition rows, we enforce:
+        //
+        //   hash_state[0..4] == next_root[0..4]  (columns 156..159)
+        //
+        // This encodes r_{i+1} = RPO_7(r_i, slot_i, stake_i, blockhash).
+
+        for i in 0..4 {
+            result[constraint_idx] =
+                (current[i] - current[156 + i]) * is_transition_round;
+            constraint_idx += 1;
+        }
+    }
+
+    fn get_assertions(&self) -> Vec<Assertion<Felt>> {
+        let last_step = self.trace_length() - 1;
+        let mut assertions = Vec::new();
+
+        // Slots: bind endpoints.
+        assertions.push(Assertion::single(13, 0, Felt::new(self.pub_inputs.start_slot)));
+        assertions.push(Assertion::single(13, last_step, Felt::new(self.pub_inputs.end_slot)));
+
+        // Initial root r_0 at first row.
+        let init_root = bytes_to_felts(&self.pub_inputs.initial_state_root);
+        for i in 0..4 {
+            assertions.push(Assertion::single(i, 0, init_root[i]));
+        }
+
+        // Final root r_n at last row.
+        let final_root = bytes_to_felts(&self.pub_inputs.final_state_root);
+        for i in 0..4 {
+            assertions.push(Assertion::single(i, last_step, final_root[i]));
+        }
+
+        assertions
+    }
+}
+
+// ================================================================================================
+// PROVER IMPLEMENTATION
+// ================================================================================================
+
+struct SolanaProver {
+    options: ProofOptions,
+    pub_inputs: PublicInputs,
+}
+
+impl Prover for SolanaProver {
+    type BaseField = Felt;
+    type Air = SolanaStateAir;
+    type Trace = TraceTable<Felt>;
+    type HashFn = Rp64_256;
+    type RandomCoin = DefaultRandomCoin<Self::HashFn>;
+    type TraceLde<E: FieldElement<BaseField = Felt>> =
+        DefaultTraceLde<E, Self::HashFn, MerkleTree<Self::HashFn>>;
+    type ConstraintEvaluator<'a, E: FieldElement<BaseField = Felt>> =
+        DefaultConstraintEvaluator<'a, Self::Air, E>;
+    type ConstraintCommitment<E: FieldElement<BaseField = Felt>> =
+        DefaultConstraintCommitment<E, Self::HashFn, MerkleTree<Self::HashFn>>;
+    type VC = MerkleTree<Self::HashFn>;
+
+    fn get_pub_inputs(&self, _trace: &Self::Trace) -> PublicInputs {
+        self.pub_inputs.clone()
+    }
+
+    fn options(&self) -> &ProofOptions {
+        &self.options
+    }
+
+    fn new_trace_lde<E: FieldElement<BaseField = Felt>>(
+        &self,
+        trace_info: &TraceInfo,
+        main_trace: &ColMatrix<Felt>,
+        domain: &StarkDomain<Felt>,
+        partition_options: winter_prover::PartitionOptions,
+    ) -> (Self::TraceLde<E>, TracePolyTable<E>) {
+        DefaultTraceLde::new(trace_info, main_trace, domain, partition_options)
+    }
+
+    fn new_evaluator<'a, E: FieldElement<BaseField = Felt>>(
+        &self,
+        air: &'a Self::Air,
+        aux_rand_elements: Option<winter_air::AuxRandElements<E>>,
+        composition_coefficients: winter_air::ConstraintCompositionCoefficients<E>,
+    ) -> Self::ConstraintEvaluator<'a, E> {
+        DefaultConstraintEvaluator::new(air, aux_rand_elements, composition_coefficients)
+    }
+
+    fn build_constraint_commitment<E: FieldElement<BaseField = Felt>>(
+        &self,
+        composition_poly_trace: winter_prover::CompositionPolyTrace<E>,
+        num_constraint_composition_columns: usize,
+        domain: &StarkDomain<Felt>,
+        partition_options: winter_prover::PartitionOptions,
+    ) -> (Self::ConstraintCommitment<E>, winter_prover::CompositionPoly<E>) {
+        DefaultConstraintCommitment::new(
+            composition_poly_trace,
+            num_constraint_composition_columns,
+            domain,
+            partition_options,
+        )
+    }
+}
+
+// ================================================================================================
+// PUBLIC API
+// ================================================================================================
+
+pub fn generate_proof(
+    pub_inputs: PublicInputs,
+    witnesses: &[crate::witness::SlotWitness],
+) -> Result<StarkProofEnvelope> {
+    let trace = build_trace(witnesses, &pub_inputs).context("Trace generation failed")?;
+
+    // Example security params (roughly ~128-bit, tweak as needed).
+    let options = ProofOptions::new(
+        64, // queries
+        16, // blowup
+        20, // grinding factor
+        FieldExtension::Quadratic,
+        8,  // FRI folding
+        31, // FRI max remainder degree
+    );
+
+    let prover = SolanaProver {
+        options,
+        pub_inputs: pub_inputs.clone(),
+    };
+
+    let proof = prover
+        .prove(trace)
+        .map_err(|e| anyhow::anyhow!("Proof generation failed: {}", e))?;
+
+    Ok(StarkProofEnvelope {
+        proof: B64.encode(proof.to_bytes()),
+        public_inputs: pub_inputs,
+    })
+}
+
+pub fn verify_proof(envelope: StarkProofEnvelope) -> Result<bool> {
+    let proof_bytes = B64
+        .decode(envelope.proof)
+        .context("Failed to decode base64 proof")?;
+    let proof = Proof::from_bytes(&proof_bytes).context("Failed to deserialize proof")?;
+
+    let options = ProofOptions::new(64, 16, 20, FieldExtension::Quadratic, 8, 31);
+    let acceptable = AcceptableOptions::Option(options);
+
+    match verify::<SolanaStateAir, Rp64_256, DefaultRandomCoin<Rp64_256>, MerkleTree<Rp64_256>>(
+        proof,
+        envelope.public_inputs,
+        &acceptable,
+    ) {
+        Ok(_) => Ok(true),
+        Err(VerifierError::ProofVerificationError(_)) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("Verification system error: {}", e)),
+    }
+}
+
+// ================================================================================================
+// HELPERS
+// ================================================================================================
+
+fn bytes_to_felts(bytes: &[u8; 32]) -> Vec<Felt> {
+    (0..4)
+        .map(|i| {
+            let start = i * 8;
+            let chunk = &bytes[start..start + 8];
+            Felt::new(u64::from_le_bytes(chunk.try_into().unwrap()))
+        })
+        .collect()
+}
+
+// ================================================================================================
+// REQUIRED EXTERNAL DEFINITIONS (same as before)
+// ================================================================================================
+//
+// pub mod witness {
+//     pub struct SlotWitness {
+//         pub slot: u64,
+//         pub state_root: [u8; 32],          // intermediate roots r_i (private)
+//         pub vote_accounts: Vec<VoteAccount>,
+//     }
+//
+//     pub struct VoteAccount {
+//         pub activated_stake: u64,
+//     }
+// }
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::missing_errors_doc)]
+
+use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use serde::{Deserialize, Serialize};
+use winter_air::{
+    Air, AirContext, Assertion, EvaluationFrame, FieldExtension, ProofOptions, TraceInfo,
+    TransitionConstraintDegree,
+};
+use winter_crypto::{hashers::Rp64_256, DefaultRandomCoin, MerkleTree};
+use winter_math::{fields::f64::BaseElement as Felt, FieldElement, StarkField, ToElements};
+use winter_prover::{
+    matrix::ColMatrix, DefaultConstraintCommitment, DefaultConstraintEvaluator, DefaultTraceLde,
+    Proof, Prover, StarkDomain, TracePolyTable, TraceTable,
+};
+use winter_verifier::{verify, AcceptableOptions, VerifierError};
+
+// ================================================================================================
+// RPO-256 CONSTANTS (Polygon Miden style; must be fixed & agreed off-chain)
+// ================================================================================================
+
+const TWO_32: u64 = 4294967296;
+const RPO_ALPHA: u64 = 7;
+const STATE_WIDTH: usize = 12;
+const NUM_ROUNDS: usize = 7;
+const ROUNDS_PER_WITNESS: usize = NUM_ROUNDS + 1; // 7 hash rounds + 1 transition row
+
+// Circulant MDS
+#[rustfmt::skip]
+const MDS: [[u64; 12]; 12] = [
+    [7, 23, 8, 26, 13, 10, 9, 4, 5, 2, 3, 1],
+    [1, 7, 23, 8, 26, 13, 10, 9, 4, 5, 2, 3],
+    [3, 1, 7, 23, 8, 26, 13, 10, 9, 4, 5, 2],
+    [2, 3, 1, 7, 23, 8, 26, 13, 10, 9, 4, 5],
+    [5, 2, 3, 1, 7, 23, 8, 26, 13, 10, 9, 4],
+    [4, 5, 2, 3, 1, 7, 23, 8, 26, 13, 10, 9],
+    [9, 4, 5, 2, 3, 1, 7, 23, 8, 26, 13, 10],
+    [10, 9, 4, 5, 2, 3, 1, 7, 23, 8, 26, 13],
+    [13, 10, 9, 4, 5, 2, 3, 1, 7, 23, 8, 26],
+    [26, 13, 10, 9, 4, 5, 2, 3, 1, 7, 23, 8],
+    [8, 26, 13, 10, 9, 4, 5, 2, 3, 1, 7, 23],
+    [23, 8, 26, 13, 10, 9, 4, 5, 2, 3, 1, 7],
+];
+
+// Example ARK constants – must be fixed once and shared by prover/verifier.
+// They *do not* need to match Polygon mainnet RPO as long as both sides agree.
+#[rustfmt::skip]
+const ARK: [[u64; 12]; NUM_ROUNDS] = [
+    [0x88c21a6d05a84b28, 0x548196cb68458a88, 0x3e8acfe0c6e89015, 0x95d8d79dc0e5a5a2,
+     0x8e6a0fd8c5d0e9eb, 0x82c0a5f37f8e62b8, 0x4e9f17f27c4a3b5c, 0x6b5e6e7a8f6d5a4c,
+     0x2c3e5f6a7b8c9d0e, 0x1f2e3d4c5b6a7988, 0x8796a5b4c3d2e1f0, 0xf0e1d2c3b4a59687],
+    [0xd16d14d1387ae2fc, 0x6854e56efb8a5819, 0x95176c0e73f14a9e, 0xa687ec279c2e8c8e,
+     0xef3e88d6c2b89f6f, 0xb384a6bb7c3e9fa9, 0x7c8e5d4a3b2c1d0e, 0x9f8e7d6c5b4a3928,
+     0x1a2b3c4d5e6f7089, 0x89706f5e4d3c2b1a, 0x0f1e2d3c4b5a6978, 0x7869584736251403],
+    [0x4a5e3c2d1e0f8796, 0x9687a5b4c3d2e1f0, 0xf0e1d2c3b4a59687, 0x8796a5b4c3d2e1f0,
+     0x1f2e3d4c5b6a7988, 0x8897a6b5c4d3e2f1, 0x2d3c4b5a69788796, 0x96877685a49392a1,
+     0xa1b2c3d4e5f67890, 0x0f1e2d3c4b5a6978, 0x7869584736251403, 0x0312243546576879],
+    [0x5a6b7c8d9e0f1a2b, 0x3c4d5e6f70819283, 0x94a5b6c7d8e9f0a1, 0xb2c3d4e5f6071829,
+     0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829, 0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829,
+     0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829, 0x3a4b5c6d7e8f90a1, 0xb2c3d4e5f6071829],
+    [0x1d2e3f4a5b6c7d8e, 0x9f0a1b2c3d4e5f60, 0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60,
+     0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60, 0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60,
+     0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60, 0x718293a4b5c6d7e8, 0xf90a1b2c3d4e5f60],
+    [0x2b3c4d5e6f708192, 0x83940a5b6c7d8e9f, 0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9,
+     0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9, 0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9,
+     0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9, 0x0a1b2c3d4e5f6071, 0x8293a4b5c6d7e8f9],
+    [0x3e4f5061728394a5, 0xb6c7d8e9f0a1b2c3, 0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3,
+     0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3, 0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3,
+     0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3, 0xd4e5f60718293a4b, 0x5c6d7e8f90a1b2c3],
+];
+
+// ================================================================================================
+// DATA STRUCTURES
+// ================================================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublicInputs {
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub initial_state_root: [u8; 32],
+    pub final_state_root: [u8; 32],
+    pub blockhash: [u8; 32],
+}
+
+impl ToElements<Felt> for PublicInputs {
+    fn to_elements(&self) -> Vec<Felt> {
+        let mut res = Vec::with_capacity(14);
+        res.push(Felt::new(self.start_slot));
+        res.push(Felt::new(self.end_slot));
+        res.extend(bytes_to_felts(&self.initial_state_root));
+        res.extend(bytes_to_felts(&self.final_state_root));
+        res.extend(bytes_to_felts(&self.blockhash));
+        res
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct StarkProofEnvelope {
+    pub proof: String,
+    pub public_inputs: PublicInputs,
+}
+
+// ================================================================================================
+// TRACE GENERATION
+// ================================================================================================
+//
+// Trace layout (161 columns):
+//
+//  0..11   : RPO state
+//  12      : round counter (0..7)
+//  13      : slot
+//  14..21  : slot delta bits (8 bits)
+//  22      : stake_lo (32-bit)
+//  23      : stake_hi (32-bit)
+//  24      : delta_lo (32-bit)
+//  25      : delta_hi (32-bit)
+//  26      : aux carry/borrow bit
+//  27      : sign (0 = add, 1 = sub) comparing stake_{i+1} vs stake_i
+//  28..59  : stake_lo bits
+//  60..91  : stake_hi bits
+//  92..123 : delta_lo bits
+//  124..155: delta_hi bits
+//  156..159: "next_root" felts for this witness segment
+//  160     : transition_flag (1 on last row of a witness)
+
+const NUM_COLS: usize = 161;
+
+pub fn build_trace(
+    witnesses: &[crate::witness::SlotWitness],
+    pub_inputs: &PublicInputs,
+) -> Result<TraceTable<Felt>> {
+    if witnesses.is_empty() {
+        anyhow::bail!("Witnesses cannot be empty");
+    }
+    if witnesses.len() > 100_000 {
+        anyhow::bail!("Trace exceeds maximum length (100,000 witnesses)");
+    }
+
+    // Slot range sanity.
+    if witnesses[0].slot != pub_inputs.start_slot {
+        anyhow::bail!(
+            "Start slot mismatch: witness[0]={}, public={}",
+            witnesses[0].slot,
+            pub_inputs.start_slot
+        );
+    }
+    if witnesses.last().unwrap().slot != pub_inputs.end_slot {
+        anyhow::bail!(
+            "End slot mismatch: last witness={}, public={}",
+            witnesses.last().unwrap().slot,
+            pub_inputs.end_slot
+        );
+    }
+
+    // Slots strictly increasing.
+    for i in 1..witnesses.len() {
+        if witnesses[i].slot <= witnesses[i - 1].slot {
+            anyhow::bail!("Slots must be strictly increasing at index {}", i);
+        }
+    }
+
+    let trace_len = witnesses.len() * ROUNDS_PER_WITNESS;
+    let mut trace = vec![Vec::with_capacity(trace_len); NUM_COLS];
+
+    let blockhash_felts = bytes_to_felts(&pub_inputs.blockhash);
+
+    // We build a chain of roots r_0..r_n.
+    // r_0 = initial_state_root (public).
+    // For i in [0..n-1]:
+    //   r_{i+1} = RPO_7( r_i || slot_i || stake_i || blockhash ).
+    //
+    // The witnesses carry private intermediate roots (and stakes), but the public statement
+    // refers only to r_0 and r_n.
+
+    let mut prev_root = bytes_to_felts(&pub_inputs.initial_state_root);
+
+    for (witness_idx, w) in witnesses.iter().enumerate() {
+        let is_last_witness = witness_idx == witnesses.len() - 1;
+
+        // Compute total_stake for this slot.
+        let total_stake_u128: u128 = w
+            .vote_accounts
+            .iter()
+            .map(|v| v.activated_stake as u128)
+            .sum();
+
+        if total_stake_u128 > u64::MAX as u128 {
+            anyhow::bail!("Stake overflow at slot {}", w.slot);
+        }
+        let total_stake = total_stake_u128 as u64;
+
+        // Next stake for delta (or zero for last).
+        let next_stake = if is_last_witness {
+            total_stake
+        } else {
+            let s: u128 = witnesses[witness_idx + 1]
+                .vote_accounts
+                .iter()
+                .map(|v| v.activated_stake as u128)
+                .sum();
+            if s > u64::MAX as u128 {
+                anyhow::bail!(
+                    "Stake overflow at next slot {}",
+                    witnesses[witness_idx + 1].slot
+                );
+            }
+            s as u64
+        };
+
+        let (delta_abs, sign) = if next_stake >= total_stake {
+            (next_stake - total_stake, 0u64)
+        } else {
+            (total_stake - next_stake, 1u64)
+        };
+
+        let stake_lo = total_stake & 0xFFFF_FFFF;
+        let stake_hi = total_stake >> 32;
+        let delta_lo = delta_abs & 0xFFFF_FFFF;
+        let delta_hi = delta_abs >> 32;
+
+        if stake_lo > 0xFFFF_FFFF || stake_hi > 0xFFFF_FFFF {
+            anyhow::bail!("Stake limb overflow at slot {}", w.slot);
+        }
+        if delta_lo > 0xFFFF_FFFF || delta_hi > 0xFFFF_FFFF {
+            anyhow::bail!("Delta limb overflow at slot {}", w.slot);
+        }
+
+        let slot_delta = if is_last_witness {
+            0u64
+        } else {
+            witnesses[witness_idx + 1].slot - w.slot
+        };
+        if slot_delta >= 256 {
+            anyhow::bail!("Slot delta too large at slot {}: {}", w.slot, slot_delta);
+        }
+
+        // Target root r_{i+1}.
+        let next_root = if is_last_witness {
+            bytes_to_felts(&pub_inputs.final_state_root)
+        } else {
+            bytes_to_felts(&witnesses[witness_idx + 1].state_root)
+        };
+
+        // Hash state for this witness.
+        let mut hash_state = [Felt::ZERO; STATE_WIDTH];
+
+        // 8 rows per witness: 7 hash rounds + 1 transition.
+        for round in 0..ROUNDS_PER_WITNESS {
+            // Round counter
+            trace[12].push(Felt::new(round as u64));
+
+            // Hash evolution: only for rounds 0..6.
+            if round < NUM_ROUNDS {
+                if round == 0 {
+                    // Initialize state for this witness:
+                    // [ r_i[0..4], slot, stake_lo, stake_hi, blockhash[0..4] ]
+                    hash_state = [Felt::ZERO; STATE_WIDTH];
+                    hash_state[0] = prev_root[0];
+                    hash_state[1] = prev_root[1];
+                    hash_state[2] = prev_root[2];
+                    hash_state[3] = prev_root[3];
+                    hash_state[4] = Felt::new(w.slot);
+                    hash_state[5] = Felt::new(stake_lo);
+                    hash_state[6] = Felt::new(stake_hi);
+                    hash_state[7] = blockhash_felts[0];
+                    hash_state[8] = blockhash_felts[1];
+                    hash_state[9] = blockhash_felts[2];
+                    hash_state[10] = blockhash_felts[3];
+                    hash_state[11] = Felt::ZERO;
+                }
+
+                // Apply one RPO round: S-Box then MDS.
+                let mut after_sbox = [Felt::ZERO; STATE_WIDTH];
+                for i in 0..STATE_WIDTH {
+                    let ark = Felt::new(ARK[round][i]);
+                    after_sbox[i] = (hash_state[i] + ark).exp(Felt::from(RPO_ALPHA));
+                }
+
+                let mut next_state = [Felt::ZERO; STATE_WIDTH];
+                for i in 0..STATE_WIDTH {
+                    for j in 0..STATE_WIDTH {
+                        next_state[i] += after_sbox[j] * Felt::new(MDS[i][j]);
+                    }
+                }
+
+                hash_state = next_state;
+            }
+
+            // Push hash state.
+            for i in 0..STATE_WIDTH {
+                trace[i].push(hash_state[i]);
+            }
+
+            // Slot column.
+            trace[13].push(Felt::new(w.slot));
+
+            // Slot delta bits.
+            for b in 0..8 {
+                trace[14 + b].push(Felt::new((slot_delta >> b) & 1));
+            }
+
+            // Arithmetic columns.
+            trace[22].push(Felt::new(stake_lo));
+            trace[23].push(Felt::new(stake_hi));
+            trace[24].push(Felt::new(delta_lo));
+            trace[25].push(Felt::new(delta_hi));
+            trace[26].push(Felt::new(aux_for(stake_lo, delta_lo, sign)));
+            trace[27].push(Felt::new(sign));
+
+            // Bit decompositions.
+            push_bits(&mut trace, 28, stake_lo, 32);
+            push_bits(&mut trace, 60, stake_hi, 32);
+            push_bits(&mut trace, 92, delta_lo, 32);
+            push_bits(&mut trace, 124, delta_hi, 32);
+
+            // Target root columns (r_{i+1}); constant across this witness.
+            for j in 0..4 {
+                trace[156 + j].push(next_root[j]);
+            }
+
+            // Transition flag: 1 on last row (round == 7), else 0.
+            let is_transition = if round == ROUNDS_PER_WITNESS - 1 {
+                1u64
+            } else {
+                0u64
+            };
+            trace[160].push(Felt::new(is_transition));
+        }
+
+        // Move to next root in the chain.
+        prev_root = next_root;
+    }
+
+    Ok(TraceTable::init(trace))
+}
+
+fn aux_for(stake_lo: u64, delta_lo: u64, sign: u64) -> u64 {
+    if sign == 0 {
+        // add: carry out
+        (stake_lo + delta_lo) / TWO_32
+    } else {
+        // sub: borrow
+        if stake_lo < delta_lo {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+fn push_bits(trace: &mut [Vec<Felt>], start_col: usize, value: u64, num_bits: usize) {
+    for b in 0..num_bits {
+        trace[start_col + b].push(Felt::new((value >> b) & 1));
+    }
+}
+
+// ================================================================================================
+// AIR IMPLEMENTATION
+// ================================================================================================
+
+#[derive(Clone)]
+pub struct SolanaStateAir {
+    context: AirContext<Felt>,
+    pub_inputs: PublicInputs,
+}
+
+impl Air for SolanaStateAir {
+    type BaseField = Felt;
+    type PublicInputs = PublicInputs;
+
+    fn new(trace_info: TraceInfo, pub_inputs: PublicInputs, options: ProofOptions) -> Self {
+        let mut degrees = Vec::new();
+
+        // 0..11: hash constraints (degree ~7 due to x^7 S-box).
+        for _ in 0..12 {
+            degrees.push(TransitionConstraintDegree::new(7));
+        }
+
+        // 12: round counter (degree 1).
+        degrees.push(TransitionConstraintDegree::new(1));
+
+        // 13: slot transition (degree 2).
+        degrees.push(TransitionConstraintDegree::new(2));
+
+        // 14..21: slot bits binary (degree 2).
+        for _ in 0..8 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        // 22..27: arithmetic constraints (degree 2).
+        for _ in 0..6 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        // 28..155: bit validity (degree 2).
+        for _ in 0..128 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        // Bit recomposition (4 limbs) (degree 1).
+        for _ in 0..4 {
+            degrees.push(TransitionConstraintDegree::new(1));
+        }
+
+        // Root chaining constraints (4 coords) (degree 2).
+        for _ in 0..4 {
+            degrees.push(TransitionConstraintDegree::new(2));
+        }
+
+        let options = options.with_field_extension(FieldExtension::Quadratic);
+        let context = AirContext::new(trace_info, degrees, 8, options);
+        Self { context, pub_inputs }
+    }
+
+    fn context(&self) -> &AirContext<Felt> {
+        &self.context
+    }
+
+    fn evaluate_transition<E: FieldElement<BaseField = Felt>>(
+        &self,
+        frame: &EvaluationFrame<E>,
+        _periodic_values: &[E],
+        result: &mut [E],
+    ) {
+        let current = frame.current();
+        let next = frame.next();
+
+        let one = E::ONE;
+        let two_32 = E::from(TWO_32);
+
+        let round = current[12];
+        let transition_flag = current[160];
+        let is_hash_round = one - transition_flag;
+        let is_transition_round = transition_flag;
+
+        let mut constraint_idx = 0;
+
+        // ---------------------------
+        // 1. HASH CONSTRAINTS (0..11)
+        // ---------------------------
+        //
+        // For rows with transition_flag = 0:
+        // next_state = MDS( (current_state + ARK_round)^7 ).
+        //
+        // For rows with transition_flag = 1 (round==7), hash constraint is disabled.
+
+        let round_idx = (round.as_int() as usize) % NUM_ROUNDS;
+
+        // Precompute S-box for all lanes.
+        let mut sbox_values = [E::ZERO; STATE_WIDTH];
+        for j in 0..STATE_WIDTH {
+            let ark_j = E::from(ARK[round_idx][j]);
+            sbox_values[j] = (current[j] + ark_j).exp(E::PositiveInteger::from(RPO_ALPHA));
+        }
+
+        for i in 0..STATE_WIDTH {
+            let mut mds_result = E::ZERO;
+            for j in 0..STATE_WIDTH {
+                mds_result += sbox_values[j] * E::from(MDS[i][j]);
+            }
+            result[constraint_idx] = (next[i] - mds_result) * is_hash_round;
+            constraint_idx += 1;
+        }
+
+        // ------------------------------------
+        // 2. ROUND COUNTER PROGRESSION (index)
+        // ------------------------------------
+        //
+        // round' = round + 1        on hash rows
+        // round' = 0                on transition row
+        //
+        // Implemented as: round' = round + 1 - transition_flag * 8
+
+        let next_round_expected = (round + one) - (transition_flag * E::from(8u32));
+        result[constraint_idx] = next[12] - next_round_expected;
+        constraint_idx += 1;
+
+        // ----------------------------
+        // 3. SLOT TRANSITION (index)
+        // ----------------------------
+        //
+        // Let slot_delta be reconstructed from bits[14..21].
+        // On transition rows: next_slot = current_slot + slot_delta.
+
+        let mut slot_delta = E::ZERO;
+        let mut pow2 = E::ONE;
+        for i in 0..8 {
+            slot_delta += current[14 + i] * pow2;
+            pow2 *= E::from(2u32);
+        }
+
+        result[constraint_idx] =
+            (next[13] - (current[13] + slot_delta)) * is_transition_round;
+        constraint_idx += 1;
+
+        // ---------------------
+        // 4. SLOT BIT BINARY
+        // ---------------------
+
+        for i in 0..8 {
+            let bit = current[14 + i];
+            result[constraint_idx] = bit * (bit - one);
+            constraint_idx += 1;
+        }
+
+        // ------------------------
+        // 5. ARITHMETIC LANE
+        // ------------------------
+        //
+        // stake_{i+1} = stake_i ± delta, with aux carry/borrow, checked on transition rows.
+
+        let stake_lo = current[22];
+        let stake_hi = current[23];
+        let delta_lo = current[24];
+        let delta_hi = current[25];
+        let aux = current[26];
+        let sign = current[27];
+
+        let stake_lo_next = next[22];
+        let stake_hi_next = next[23];
+
+        let is_add = one - sign;
+        let is_sub = sign;
+
+        // Low limb:
+        //
+        // Add: stake_lo + delta_lo = stake_lo_next + aux * 2^32
+        // Sub: stake_lo - delta_lo + aux * 2^32 = stake_lo_next
+
+        let add_lo =
+            (stake_lo + delta_lo) - (stake_lo_next + aux * two_32);
+        let sub_lo =
+            (stake_lo - delta_lo + aux * two_32) - stake_lo_next;
+
+        result[constraint_idx] =
+            (is_add * add_lo + is_sub * sub_lo) * is_transition_round;
+        constraint_idx += 1;
+
+        // High limb:
+        //
+        // Add: stake_hi + delta_hi + aux = stake_hi_next
+        // Sub: stake_hi - delta_hi - aux = stake_hi_next
+
+        let add_hi = (stake_hi + delta_hi + aux) - stake_hi_next;
+        let sub_hi = (stake_hi - delta_hi - aux) - stake_hi_next;
+
+        result[constraint_idx] =
+            (is_add * add_hi + is_sub * sub_hi) * is_transition_round;
+        constraint_idx += 1;
+
+        // aux binary
+        result[constraint_idx] = aux * (aux - one);
+        constraint_idx += 1;
+
+        // sign binary
+        result[constraint_idx] = sign * (sign - one);
+        constraint_idx += 1;
+
+        // delta const within witness on hash rows
+        result[constraint_idx] = (next[24] - delta_lo) * is_hash_round;
+        constraint_idx += 1;
+
+        result[constraint_idx] = (next[25] - delta_hi) * is_hash_round;
+        constraint_idx += 1;
+
+        // -------------------------
+        // 6. BIT VALIDITY 0/1
+        // -------------------------
+
+        for i in 0..128 {
+            let bit = current[28 + i];
+            result[constraint_idx] = bit * (bit - one);
+            constraint_idx += 1;
+        }
+
+        // -----------------------------
+        // 7. BIT RECOMPOSITION (4 limbs)
+        // -----------------------------
+
+        let limbs_to_check = [(22usize, 28usize), (23, 60), (24, 92), (25, 124)];
+
+        for (limb_col, bit_start) in limbs_to_check {
+            let mut reconstructed = E::ZERO;
+            let mut p2 = E::ONE;
+            for i in 0..32 {
+                reconstructed += current[bit_start + i] * p2;
+                p2 *= E::from(2u32);
+            }
+            result[constraint_idx] = current[limb_col] - reconstructed;
+            constraint_idx += 1;
+        }
+
+        // ------------------------------------
+        // 8. ROOT CHAINING ON TRANSITION ROWS
+        // ------------------------------------
+        //
+        // Columns[0..4] carry the RPO state. On transition rows, we enforce:
+        //
+        //   hash_state[0..4] == next_root[0..4]  (columns 156..159)
+        //
+        // This encodes r_{i+1} = RPO_7(r_i, slot_i, stake_i, blockhash).
+
+        for i in 0..4 {
+            result[constraint_idx] =
+                (current[i] - current[156 + i]) * is_transition_round;
+            constraint_idx += 1;
+        }
+    }
+
+    fn get_assertions(&self) -> Vec<Assertion<Felt>> {
+        let last_step = self.trace_length() - 1;
+        let mut assertions = Vec::new();
+
+        // Slots: bind endpoints.
+        assertions.push(Assertion::single(13, 0, Felt::new(self.pub_inputs.start_slot)));
+        assertions.push(Assertion::single(13, last_step, Felt::new(self.pub_inputs.end_slot)));
+
+        // Initial root r_0 at first row.
+        let init_root = bytes_to_felts(&self.pub_inputs.initial_state_root);
+        for i in 0..4 {
+            assertions.push(Assertion::single(i, 0, init_root[i]));
+        }
+
+        // Final root r_n at last row.
+        let final_root = bytes_to_felts(&self.pub_inputs.final_state_root);
+        for i in 0..4 {
+            assertions.push(Assertion::single(i, last_step, final_root[i]));
+        }
+
+        assertions
+    }
+}
+
+// ================================================================================================
+// PROVER IMPLEMENTATION
+// ================================================================================================
+
+struct SolanaProver {
+    options: ProofOptions,
+    pub_inputs: PublicInputs,
+}
+
+impl Prover for SolanaProver {
+    type BaseField = Felt;
+    type Air = SolanaStateAir;
+    type Trace = TraceTable<Felt>;
+    type HashFn = Rp64_256;
+    type RandomCoin = DefaultRandomCoin<Self::HashFn>;
+    type TraceLde<E: FieldElement<BaseField = Felt>> =
+        DefaultTraceLde<E, Self::HashFn, MerkleTree<Self::HashFn>>;
+    type ConstraintEvaluator<'a, E: FieldElement<BaseField = Felt>> =
+        DefaultConstraintEvaluator<'a, Self::Air, E>;
+    type ConstraintCommitment<E: FieldElement<BaseField = Felt>> =
+        DefaultConstraintCommitment<E, Self::HashFn, MerkleTree<Self::HashFn>>;
+    type VC = MerkleTree<Self::HashFn>;
+
+    fn get_pub_inputs(&self, _trace: &Self::Trace) -> PublicInputs {
+        self.pub_inputs.clone()
+    }
+
+    fn options(&self) -> &ProofOptions {
+        &self.options
+    }
+
+    fn new_trace_lde<E: FieldElement<BaseField = Felt>>(
+        &self,
+        trace_info: &TraceInfo,
+        main_trace: &ColMatrix<Felt>,
+        domain: &StarkDomain<Felt>,
+        partition_options: winter_prover::PartitionOptions,
+    ) -> (Self::TraceLde<E>, TracePolyTable<E>) {
+        DefaultTraceLde::new(trace_info, main_trace, domain, partition_options)
+    }
+
+    fn new_evaluator<'a, E: FieldElement<BaseField = Felt>>(
+        &self,
+        air: &'a Self::Air,
+        aux_rand_elements: Option<winter_air::AuxRandElements<E>>,
+        composition_coefficients: winter_air::ConstraintCompositionCoefficients<E>,
+    ) -> Self::ConstraintEvaluator<'a, E> {
+        DefaultConstraintEvaluator::new(air, aux_rand_elements, composition_coefficients)
+    }
+
+    fn build_constraint_commitment<E: FieldElement<BaseField = Felt>>(
+        &self,
+        composition_poly_trace: winter_prover::CompositionPolyTrace<E>,
+        num_constraint_composition_columns: usize,
+        domain: &StarkDomain<Felt>,
+        partition_options: winter_prover::PartitionOptions,
+    ) -> (Self::ConstraintCommitment<E>, winter_prover::CompositionPoly<E>) {
+        DefaultConstraintCommitment::new(
+            composition_poly_trace,
+            num_constraint_composition_columns,
+            domain,
+            partition_options,
+        )
+    }
+}
+
+// ================================================================================================
+// PUBLIC API
+// ================================================================================================
+
+pub fn generate_proof(
+    pub_inputs: PublicInputs,
+    witnesses: &[crate::witness::SlotWitness],
+) -> Result<StarkProofEnvelope> {
+    let trace = build_trace(witnesses, &pub_inputs).context("Trace generation failed")?;
+
+    // Example security params (roughly ~128-bit, tweak as needed).
+    let options = ProofOptions::new(
+        64, // queries
+        16, // blowup
+        20, // grinding factor
+        FieldExtension::Quadratic,
+        8,  // FRI folding
+        31, // FRI max remainder degree
+    );
+
+    let prover = SolanaProver {
+        options,
+        pub_inputs: pub_inputs.clone(),
+    };
+
+    let proof = prover
+        .prove(trace)
+        .map_err(|e| anyhow::anyhow!("Proof generation failed: {}", e))?;
+
+    Ok(StarkProofEnvelope {
+        proof: B64.encode(proof.to_bytes()),
+        public_inputs: pub_inputs,
+    })
+}
+
+pub fn verify_proof(envelope: StarkProofEnvelope) -> Result<bool> {
+    let proof_bytes = B64
+        .decode(envelope.proof)
+        .context("Failed to decode base64 proof")?;
+    let proof = Proof::from_bytes(&proof_bytes).context("Failed to deserialize proof")?;
+
+    let options = ProofOptions::new(64, 16, 20, FieldExtension::Quadratic, 8, 31);
+    let acceptable = AcceptableOptions::Option(options);
+
+    match verify::<SolanaStateAir, Rp64_256, DefaultRandomCoin<Rp64_256>, MerkleTree<Rp64_256>>(
+        proof,
+        envelope.public_inputs,
+        &acceptable,
+    ) {
+        Ok(_) => Ok(true),
+        Err(VerifierError::ProofVerificationError(_)) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("Verification system error: {}", e)),
+    }
+}
+
+// ================================================================================================
+// HELPERS
+// ================================================================================================
+
+fn bytes_to_felts(bytes: &[u8; 32]) -> Vec<Felt> {
+    (0..4)
+        .map(|i| {
+            let start = i * 8;
+            let chunk = &bytes[start..start + 8];
+            Felt::new(u64::from_le_bytes(chunk.try_into().unwrap()))
+        })
+        .collect()
+}
+
+// ================================================================================================
+// REQUIRED EXTERNAL DEFINITIONS (same as before)
+// ================================================================================================
+//
+// pub mod witness {
+//     pub struct SlotWitness {
+//         pub slot: u64,
+//         pub state_root: [u8; 32],          // intermediate roots r_i (private)
+//         pub vote_accounts: Vec<VoteAccount>,
+//     }
+//
+//     pub struct VoteAccount {
+//         pub activated_stake: u64,
+//     }
+// }
