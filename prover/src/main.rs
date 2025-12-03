@@ -80,6 +80,10 @@ struct Artifact {
 
 #[cfg(feature = "stark")]
 mod stark;
+
+// North Star Option A AIR (enabled when REQUIRE_STARK=1 at runtime)
+#[allow(dead_code)]
+mod north_star;
 #[cfg(feature = "stark")]
 mod witness;
 #[cfg(feature = "stark")]
